@@ -118,7 +118,8 @@ class HikCameraNode : public rclcpp::Node {
     // -------------------------------------------------------------------------
     // 6. Start Capture Thread
     // -------------------------------------------------------------------------
-    // Use a separate thread for grabbing frames to avoid blocking the ROS executor.
+    // Use a separate thread for grabbing frames to avoid blocking the ROS
+    // executor.
     capture_thread_ = std::thread{[this]() -> void {
       MV_FRAME_OUT out_frame;  // Struct to hold the raw frame from SDK.
       int ret = MV_OK;
@@ -185,7 +186,8 @@ class HikCameraNode : public rclcpp::Node {
                          convert_ret);
           }
 
-          // Release the internal SDK buffer (must be done even if conversion fails).
+          // Release the internal SDK buffer (must be done even if conversion
+          // fails).
           MV_CC_FreeImageBuffer(camera_handle_, &out_frame);
 
         } else {
@@ -198,7 +200,8 @@ class HikCameraNode : public rclcpp::Node {
           fail_count_++;
         }
 
-        // If continuous failures occur, shutdown the node to prevent zombie state.
+        // If continuous failures occur, shutdown the node to prevent zombie
+        // state.
         if (fail_count_ > 5) {
           RCLCPP_FATAL(this->get_logger(), "Camera failed continuously!");
           rclcpp::shutdown();
@@ -224,6 +227,7 @@ class HikCameraNode : public rclcpp::Node {
   /**
    * @brief Reads camera hardware capabilities and declares ROS parameters.
    * This ensures ROS parameters respect the camera's Min/Max limits.
+   * Also prints a summary of loaded parameters.
    */
   void DeclareParameters() {
     rcl_interfaces::msg::ParameterDescriptor param_desc;
@@ -233,7 +237,7 @@ class HikCameraNode : public rclcpp::Node {
     // Read hardware limits for exposure time.
     MV_CC_GetFloatValue(camera_handle_, "ExposureTime", &f_value);
     param_desc.description = "Exposure time in microseconds";
-    
+
     // Note: We cast to int64_t because ROS integer params are 64-bit.
     param_desc.integer_range.resize(1);
     param_desc.integer_range[0].step = 1;
@@ -248,13 +252,11 @@ class HikCameraNode : public rclcpp::Node {
     // Write the initial value to the camera hardware.
     MV_CC_SetFloatValue(camera_handle_, "ExposureTime",
                         static_cast<float>(exposure_time_param));
-    RCLCPP_INFO(this->get_logger(), "Init Exposure time: %ld",
-                exposure_time_param);
 
     // --- 2. Gain (Float/Double Parameter) ---
     MV_CC_GetFloatValue(camera_handle_, "Gain", &f_value);
     param_desc.description = "Gain";
-    
+
     // Clear integer constraints and set floating point constraints.
     param_desc.integer_range.clear();
     rcl_interfaces::msg::FloatingPointRange float_range;
@@ -269,12 +271,20 @@ class HikCameraNode : public rclcpp::Node {
 
     // Write the initial value to the camera hardware.
     MV_CC_SetFloatValue(camera_handle_, "Gain", static_cast<float>(gain_param));
-    RCLCPP_INFO(this->get_logger(), "Init Gain: %f", gain_param);
+
+    // --- FEATURE: Print all loaded parameters ---
+    RCLCPP_INFO(this->get_logger(), "======================================");
+    RCLCPP_INFO(this->get_logger(), "   HikCamera Parameter Summary        ");
+    RCLCPP_INFO(this->get_logger(), "======================================");
+    RCLCPP_INFO(this->get_logger(), " Exposure Time : %ld us", exposure_time_param);
+    RCLCPP_INFO(this->get_logger(), " Gain          : %.2f", gain_param);
+    RCLCPP_INFO(this->get_logger(), "======================================");
   }
 
   /**
    * @brief Callback function triggered when parameters are changed dynamically
    * (e.g., via command line or RQt).
+   * Logs the change request.
    */
   rcl_interfaces::msg::SetParametersResult ParametersCallback(
       const std::vector<rclcpp::Parameter>& parameters) {
@@ -283,18 +293,28 @@ class HikCameraNode : public rclcpp::Node {
 
     for (const auto& param : parameters) {
       if (param.get_name() == "exposure_time") {
+        auto new_val = param.as_int();
+        // --- FEATURE: Log parameter change ---
+        RCLCPP_INFO(this->get_logger(),
+                    "[Dynamic Reconfigure] Exposure Time -> %ld", new_val);
+
         // Handle Exposure Time change.
         int status = MV_CC_SetFloatValue(camera_handle_, "ExposureTime",
-                                         static_cast<float>(param.as_int()));
+                                         static_cast<float>(new_val));
         if (MV_OK != status) {
           result.successful = false;
           result.reason = "Failed to set exposure time, status = " +
                           std::to_string(status);
         }
       } else if (param.get_name() == "gain") {
+        auto new_val = param.as_double();
+        // --- FEATURE: Log parameter change ---
+        RCLCPP_INFO(this->get_logger(), "[Dynamic Reconfigure] Gain -> %.2f",
+                    new_val);
+
         // Handle Gain change.
-        int status = MV_CC_SetFloatValue(
-            camera_handle_, "Gain", static_cast<float>(param.as_double()));
+        int status = MV_CC_SetFloatValue(camera_handle_, "Gain",
+                                         static_cast<float>(new_val));
         if (MV_OK != status) {
           result.successful = false;
           result.reason =
@@ -302,7 +322,6 @@ class HikCameraNode : public rclcpp::Node {
         }
       } else {
         // Handle unknown parameters if necessary.
-        // For strict checking, set result.successful = false here.
       }
     }
     return result;
