@@ -1,202 +1,331 @@
 #include "MvCameraControl.h"
-// ROS
+
+// Standard C++ headers
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+
+// ROS headers
 #include <camera_info_manager/camera_info_manager.hpp>
 #include <image_transport/image_transport.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/logging.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp/utilities.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
-namespace hik_camera
-{
-class HikCameraNode : public rclcpp::Node
-{
-public:
-  explicit HikCameraNode(const rclcpp::NodeOptions & options) : Node("hik_camera", options)
-  {
+namespace hik_camera {
+
+class HikCameraNode : public rclcpp::Node {
+ public:
+  explicit HikCameraNode(const rclcpp::NodeOptions& options)
+      : Node("hik_camera", options) {
     RCLCPP_INFO(this->get_logger(), "Starting HikCameraNode!");
 
+    // -------------------------------------------------------------------------
+    // 1. Device Enumeration (Search for Camera)
+    // -------------------------------------------------------------------------
     MV_CC_DEVICE_INFO_LIST device_list;
-    // enum device
-    nRet = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
-    RCLCPP_INFO(this->get_logger(), "Found camera count = %d", device_list.nDeviceNum);
+    int ret_code = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
+    RCLCPP_INFO(this->get_logger(), "Found camera count = %d",
+                device_list.nDeviceNum);
 
+    // If no camera is found, enter a loop to retry until a device is connected.
+    // This prevents the node from crashing if the camera is plugged in late.
     while (device_list.nDeviceNum == 0 && rclcpp::ok()) {
-      RCLCPP_ERROR(this->get_logger(), "No camera found!");
-      RCLCPP_INFO(this->get_logger(), "Enum state: [%x]", nRet);
+      RCLCPP_ERROR(this->get_logger(), "No camera found! Retrying...");
+      RCLCPP_INFO(this->get_logger(), "Enum state: [%x]", ret_code);
+      // Sleep for 1 second to prevent high CPU usage during polling.
       std::this_thread::sleep_for(std::chrono::seconds(1));
-      nRet = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
+      ret_code = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
     }
 
-    MV_CC_CreateHandle(&camera_handle_, device_list.pDeviceInfo[0]);
+    // -------------------------------------------------------------------------
+    // 2. Initialize Camera Handle
+    // -------------------------------------------------------------------------
+    // Create a handle for the first found device (index 0).
+    ret_code = MV_CC_CreateHandle(&camera_handle_, device_list.pDeviceInfo[0]);
+    if (ret_code != MV_OK) {
+      RCLCPP_FATAL(this->get_logger(), "Failed to create handle: [%x]",
+                   ret_code);
+      return;
+    }
 
-    MV_CC_OpenDevice(camera_handle_);
+    // Open the device.
+    ret_code = MV_CC_OpenDevice(camera_handle_);
+    if (ret_code != MV_OK) {
+      RCLCPP_FATAL(this->get_logger(), "Failed to open device: [%x]", ret_code);
+      return;
+    }
 
-    // Get camera infomation
+    // -------------------------------------------------------------------------
+    // 3. Image Format Configuration
+    // -------------------------------------------------------------------------
+    // Get camera capabilities (max width/height) to prepare buffers.
+    // We use the default resolution configured in the camera.
     MV_CC_GetImageInfo(camera_handle_, &img_info_);
-    image_msg_.data.reserve(img_info_.nHeightMax * img_info_.nWidthMax * 3);
 
-    // Init convert param
+    // Initialize pixel conversion parameters.
+    // We convert Raw Bayer data from the camera to RGB8 for ROS compatibility.
     convert_param_.nWidth = img_info_.nWidthValue;
     convert_param_.nHeight = img_info_.nHeightValue;
     convert_param_.enDstPixelType = PixelType_Gvsp_RGB8_Packed;
 
-    bool use_sensor_data_qos = this->declare_parameter("use_sensor_data_qos", true);
-    auto qos = use_sensor_data_qos ? rmw_qos_profile_sensor_data : rmw_qos_profile_default;
-    camera_pub_ = image_transport::create_camera_publisher(this, "image_raw", qos);
+    // -------------------------------------------------------------------------
+    // 4. ROS Publisher Setup
+    // -------------------------------------------------------------------------
+    // Use SensorData QoS (Best Effort) for low-latency video streaming.
+    bool use_sensor_data_qos =
+        this->declare_parameter("use_sensor_data_qos", true);
+    auto qos = use_sensor_data_qos ? rmw_qos_profile_sensor_data
+                                   : rmw_qos_profile_default;
 
-    declareParameters();
+    camera_pub_ =
+        image_transport::create_camera_publisher(this, "image_raw", qos);
 
+    // Initialize ROS parameters and sync them with hardware settings.
+    DeclareParameters();
+
+    // Start image acquisition from the camera.
     MV_CC_StartGrabbing(camera_handle_);
 
-    // Load camera info
+    // -------------------------------------------------------------------------
+    // 5. Camera Calibration Info
+    // -------------------------------------------------------------------------
     camera_name_ = this->declare_parameter("camera_name", "narrow_stereo");
     camera_info_manager_ =
-      std::make_unique<camera_info_manager::CameraInfoManager>(this, camera_name_);
-    auto camera_info_url =
-      this->declare_parameter("camera_info_url", "package://hik_camera/config/camera_info.yaml");
+        std::make_unique<camera_info_manager::CameraInfoManager>(this,
+                                                                 camera_name_);
+
+    // Load calibration file from the config directory.
+    auto camera_info_url = this->declare_parameter(
+        "camera_info_url", "package://hik_camera/config/camera_info.yaml");
+
     if (camera_info_manager_->validateURL(camera_info_url)) {
       camera_info_manager_->loadCameraInfo(camera_info_url);
       camera_info_msg_ = camera_info_manager_->getCameraInfo();
     } else {
-      RCLCPP_WARN(this->get_logger(), "Invalid camera info URL: %s", camera_info_url.c_str());
+      RCLCPP_WARN(this->get_logger(), "Invalid camera info URL: %s",
+                  camera_info_url.c_str());
     }
 
+    // Register a callback for dynamic parameter reconfiguration.
     params_callback_handle_ = this->add_on_set_parameters_callback(
-      std::bind(&HikCameraNode::parametersCallback, this, std::placeholders::_1));
+        std::bind(&HikCameraNode::ParametersCallback, this,
+                  std::placeholders::_1));
 
+    // -------------------------------------------------------------------------
+    // 6. Start Capture Thread
+    // -------------------------------------------------------------------------
+    // Use a separate thread for grabbing frames to avoid blocking the ROS executor.
     capture_thread_ = std::thread{[this]() -> void {
-      MV_FRAME_OUT out_frame;
+      MV_FRAME_OUT out_frame;  // Struct to hold the raw frame from SDK.
+      int ret = MV_OK;
 
       RCLCPP_INFO(this->get_logger(), "Publishing image!");
 
-      image_msg_.header.frame_id = "camera_optical_frame";
+      // Set default frame_id if not provided by the calibration file.
+      std::string frame_id = "camera_optical_frame";
+      if (!camera_info_msg_.header.frame_id.empty()) {
+        frame_id = camera_info_msg_.header.frame_id;
+      }
+
       image_msg_.encoding = "rgb8";
 
       while (rclcpp::ok()) {
-        nRet = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
-        if (MV_OK == nRet) {
+        // Attempt to retrieve a frame with a 1000ms timeout.
+        ret = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
+
+        // Record timestamp immediately after acquisition for higher accuracy.
+        rclcpp::Time capture_time = this->now();
+
+        if (MV_OK == ret) {
+          // --- Data Conversion Logic ---
+
+          // Calculate the required size for an RGB8 image (Width * Height * 3).
+          size_t required_size =
+              out_frame.stFrameInfo.nWidth * out_frame.stFrameInfo.nHeight * 3;
+
+          // CRITICAL FIX: Resize the vector if the size doesn't match.
+          // In the original code, reserve() was used, but size() remained 0,
+          // causing the SDK conversion to fail.
+          if (image_msg_.data.size() != required_size) {
+            image_msg_.data.resize(required_size);
+          }
+
+          // Point the SDK conversion buffer to the ROS message data vector.
           convert_param_.pDstBuffer = image_msg_.data.data();
           convert_param_.nDstBufferSize = image_msg_.data.size();
           convert_param_.pSrcData = out_frame.pBufAddr;
           convert_param_.nSrcDataLen = out_frame.stFrameInfo.nFrameLen;
           convert_param_.enSrcPixelType = out_frame.stFrameInfo.enPixelType;
 
-          MV_CC_ConvertPixelType(camera_handle_, &convert_param_);
+          // Perform pixel conversion (Raw Bayer -> RGB8).
+          int convert_ret =
+              MV_CC_ConvertPixelType(camera_handle_, &convert_param_);
 
-          image_msg_.header.stamp = this->now();
-          image_msg_.height = out_frame.stFrameInfo.nHeight;
-          image_msg_.width = out_frame.stFrameInfo.nWidth;
-          image_msg_.step = out_frame.stFrameInfo.nWidth * 3;
-          image_msg_.data.resize(image_msg_.width * image_msg_.height * 3);
+          if (convert_ret == MV_OK) {
+            // Populate ROS message headers.
+            image_msg_.header.stamp = capture_time;
+            image_msg_.header.frame_id = frame_id;
+            image_msg_.height = out_frame.stFrameInfo.nHeight;
+            image_msg_.width = out_frame.stFrameInfo.nWidth;
+            image_msg_.step = out_frame.stFrameInfo.nWidth * 3;
 
-          camera_info_msg_.header = image_msg_.header;
-          camera_pub_.publish(image_msg_, camera_info_msg_);
+            // Sync CameraInfo timestamp with the image.
+            camera_info_msg_.header = image_msg_.header;
 
+            // Publish the synchronized Image and CameraInfo.
+            camera_pub_.publish(image_msg_, camera_info_msg_);
+
+            fail_count_ = 0;  // Reset failure counter on success.
+          } else {
+            RCLCPP_ERROR(this->get_logger(), "Pixel conversion failed: [%x]",
+                         convert_ret);
+          }
+
+          // Release the internal SDK buffer (must be done even if conversion fails).
           MV_CC_FreeImageBuffer(camera_handle_, &out_frame);
-          fail_conut_ = 0;
+
         } else {
-          RCLCPP_WARN(this->get_logger(), "Get buffer failed! nRet: [%x]", nRet);
+          // --- Error Handling ---
+          RCLCPP_WARN(this->get_logger(), "Get buffer failed! Ret: [%x]", ret);
+
+          // Attempt to restart grabbing to recover from errors.
           MV_CC_StopGrabbing(camera_handle_);
           MV_CC_StartGrabbing(camera_handle_);
-          fail_conut_++;
+          fail_count_++;
         }
 
-        if (fail_conut_ > 5) {
-          RCLCPP_FATAL(this->get_logger(), "Camera failed!");
+        // If continuous failures occur, shutdown the node to prevent zombie state.
+        if (fail_count_ > 5) {
+          RCLCPP_FATAL(this->get_logger(), "Camera failed continuously!");
           rclcpp::shutdown();
         }
       }
     }};
   }
 
-  ~HikCameraNode() override
-  {
+  ~HikCameraNode() override {
+    // Ensure the capture thread is stopped before releasing resources.
     if (capture_thread_.joinable()) {
       capture_thread_.join();
     }
     if (camera_handle_) {
       MV_CC_StopGrabbing(camera_handle_);
       MV_CC_CloseDevice(camera_handle_);
-      MV_CC_DestroyHandle(&camera_handle_);
+      MV_CC_DestroyHandle(camera_handle_);
     }
     RCLCPP_INFO(this->get_logger(), "HikCameraNode destroyed!");
   }
 
-private:
-  void declareParameters()
-  {
+ private:
+  /**
+   * @brief Reads camera hardware capabilities and declares ROS parameters.
+   * This ensures ROS parameters respect the camera's Min/Max limits.
+   */
+  void DeclareParameters() {
     rcl_interfaces::msg::ParameterDescriptor param_desc;
     MVCC_FLOATVALUE f_value;
+
+    // --- 1. Exposure Time (Integer Parameter) ---
+    // Read hardware limits for exposure time.
+    MV_CC_GetFloatValue(camera_handle_, "ExposureTime", &f_value);
+    param_desc.description = "Exposure time in microseconds";
+    
+    // Note: We cast to int64_t because ROS integer params are 64-bit.
     param_desc.integer_range.resize(1);
     param_desc.integer_range[0].step = 1;
-    // Exposure time
-    param_desc.description = "Exposure time in microseconds";
-    MV_CC_GetFloatValue(camera_handle_, "ExposureTime", &f_value);
-    param_desc.integer_range[0].from_value = f_value.fMin;
-    param_desc.integer_range[0].to_value = f_value.fMax;
-    double exposure_time = this->declare_parameter("exposure_time", 5000, param_desc);
-    MV_CC_SetFloatValue(camera_handle_, "ExposureTime", exposure_time);
-    RCLCPP_INFO(this->get_logger(), "Exposure time: %f", exposure_time);
+    param_desc.integer_range[0].from_value =
+        static_cast<int64_t>(f_value.fMin);
+    param_desc.integer_range[0].to_value = static_cast<int64_t>(f_value.fMax);
 
-    // Gain
-    param_desc.description = "Gain";
+    // Declare the parameter. If not found in YAML, use default (5000).
+    int64_t exposure_time_param =
+        this->declare_parameter("exposure_time", 5000, param_desc);
+
+    // Write the initial value to the camera hardware.
+    MV_CC_SetFloatValue(camera_handle_, "ExposureTime",
+                        static_cast<float>(exposure_time_param));
+    RCLCPP_INFO(this->get_logger(), "Init Exposure time: %ld",
+                exposure_time_param);
+
+    // --- 2. Gain (Float/Double Parameter) ---
     MV_CC_GetFloatValue(camera_handle_, "Gain", &f_value);
-    param_desc.integer_range[0].from_value = f_value.fMin;
-    param_desc.integer_range[0].to_value = f_value.fMax;
-    double gain = this->declare_parameter("gain", f_value.fCurValue, param_desc);
-    MV_CC_SetFloatValue(camera_handle_, "Gain", gain);
-    RCLCPP_INFO(this->get_logger(), "Gain: %f", gain);
+    param_desc.description = "Gain";
+    
+    // Clear integer constraints and set floating point constraints.
+    param_desc.integer_range.clear();
+    rcl_interfaces::msg::FloatingPointRange float_range;
+    float_range.from_value = f_value.fMin;
+    float_range.to_value = f_value.fMax;
+    float_range.step = 0.1;
+    param_desc.floating_point_range = {float_range};
+
+    // Declare parameter. Default to the current hardware value.
+    double gain_param = this->declare_parameter(
+        "gain", static_cast<double>(f_value.fCurValue), param_desc);
+
+    // Write the initial value to the camera hardware.
+    MV_CC_SetFloatValue(camera_handle_, "Gain", static_cast<float>(gain_param));
+    RCLCPP_INFO(this->get_logger(), "Init Gain: %f", gain_param);
   }
 
-  rcl_interfaces::msg::SetParametersResult parametersCallback(
-    const std::vector<rclcpp::Parameter> & parameters)
-  {
+  /**
+   * @brief Callback function triggered when parameters are changed dynamically
+   * (e.g., via command line or RQt).
+   */
+  rcl_interfaces::msg::SetParametersResult ParametersCallback(
+      const std::vector<rclcpp::Parameter>& parameters) {
     rcl_interfaces::msg::SetParametersResult result;
     result.successful = true;
-    for (const auto & param : parameters) {
+
+    for (const auto& param : parameters) {
       if (param.get_name() == "exposure_time") {
-        int status = MV_CC_SetFloatValue(camera_handle_, "ExposureTime", param.as_int());
+        // Handle Exposure Time change.
+        int status = MV_CC_SetFloatValue(camera_handle_, "ExposureTime",
+                                         static_cast<float>(param.as_int()));
         if (MV_OK != status) {
           result.successful = false;
-          result.reason = "Failed to set exposure time, status = " + std::to_string(status);
+          result.reason = "Failed to set exposure time, status = " +
+                          std::to_string(status);
         }
       } else if (param.get_name() == "gain") {
-        int status = MV_CC_SetFloatValue(camera_handle_, "Gain", param.as_double());
+        // Handle Gain change.
+        int status = MV_CC_SetFloatValue(
+            camera_handle_, "Gain", static_cast<float>(param.as_double()));
         if (MV_OK != status) {
           result.successful = false;
-          result.reason = "Failed to set gain, status = " + std::to_string(status);
+          result.reason =
+              "Failed to set gain, status = " + std::to_string(status);
         }
       } else {
-        result.successful = false;
-        result.reason = "Unknown parameter: " + param.get_name();
+        // Handle unknown parameters if necessary.
+        // For strict checking, set result.successful = false here.
       }
     }
     return result;
   }
 
+  // --- Member Variables ---
   sensor_msgs::msg::Image image_msg_;
-
   image_transport::CameraPublisher camera_pub_;
 
-  int nRet = MV_OK;
-  void * camera_handle_;
+  void* camera_handle_ = nullptr;
   MV_IMAGE_BASIC_INFO img_info_;
-
   MV_CC_PIXEL_CONVERT_PARAM convert_param_;
 
   std::string camera_name_;
   std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
   sensor_msgs::msg::CameraInfo camera_info_msg_;
 
-  int fail_conut_ = 0;
+  int fail_count_ = 0;
   std::thread capture_thread_;
-
   OnSetParametersCallbackHandle::SharedPtr params_callback_handle_;
 };
+
 }  // namespace hik_camera
 
 #include "rclcpp_components/register_node_macro.hpp"
-
 RCLCPP_COMPONENTS_REGISTER_NODE(hik_camera::HikCameraNode)
