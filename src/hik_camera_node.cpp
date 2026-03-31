@@ -110,6 +110,14 @@ class HikCameraNode : public rclcpp::Node {
                   camera_info_url.c_str());
     }
 
+    frame_id_ = this->declare_parameter("frame_id", "");
+    if (frame_id_.empty()) {
+      frame_id_ = camera_info_msg_.header.frame_id;
+    }
+    if (frame_id_.empty()) {
+      frame_id_ = "camera_link";
+    }
+
     // Register a callback for dynamic parameter reconfiguration.
     params_callback_handle_ = this->add_on_set_parameters_callback(
         std::bind(&HikCameraNode::ParametersCallback, this,
@@ -125,12 +133,6 @@ class HikCameraNode : public rclcpp::Node {
       int ret = MV_OK;
 
       RCLCPP_INFO(this->get_logger(), "Publishing image!");
-
-      // Set default frame_id if not provided by the calibration file.
-      std::string frame_id = "camera_optical_frame";
-      if (!camera_info_msg_.header.frame_id.empty()) {
-        frame_id = camera_info_msg_.header.frame_id;
-      }
 
       image_msg_.encoding = "rgb8";
 
@@ -169,7 +171,7 @@ class HikCameraNode : public rclcpp::Node {
           if (convert_ret == MV_OK) {
             // Populate ROS message headers.
             image_msg_.header.stamp = capture_time;
-            image_msg_.header.frame_id = frame_id;
+            image_msg_.header.frame_id = frame_id_;
             image_msg_.height = out_frame.stFrameInfo.nHeight;
             image_msg_.width = out_frame.stFrameInfo.nWidth;
             image_msg_.step = out_frame.stFrameInfo.nWidth * 3;
@@ -336,6 +338,7 @@ class HikCameraNode : public rclcpp::Node {
   MV_CC_PIXEL_CONVERT_PARAM convert_param_;
 
   std::string camera_name_;
+  std::string frame_id_;
   std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
   sensor_msgs::msg::CameraInfo camera_info_msg_;
 
